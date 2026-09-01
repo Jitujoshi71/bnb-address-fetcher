@@ -4,7 +4,6 @@ use serde::Deserialize;
 use serde_json::json;
 use std::env;
 use std::fs::File;
-use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -36,31 +35,32 @@ fn fetch_batch(
     println!("Fetching Batch #{}: Blocks {} to {}", batch_num, start_block, end_block);
     println!("==========================================");
 
+    // Formatted query without excessive whitespace
     let sql_query = format!(
-        r#"
-        SELECT DISTINCT address
-        FROM (
-            SELECT "from" AS address FROM bnb.transactions WHERE block_number >= {} AND block_number < {}
-            UNION ALL
-            SELECT "to" AS address FROM bnb.transactions WHERE block_number >= {} AND block_number < {}
-        ) AS t
-        WHERE address IS NOT NULL;
-        "#,
+        "SELECT DISTINCT address FROM (SELECT \"from\" AS address FROM bnb.transactions WHERE block_number >= {} AND block_number < {} UNION ALL SELECT \"to\" AS address FROM bnb.transactions WHERE block_number >= {} AND block_number < {}) AS t WHERE address IS NOT NULL",
         start_block, end_block, start_block, end_block
     );
 
+    // Dune API raw SQL execution payload format
     let payload = json!({
-        "query_sql": sql_query,
-        "performance": "medium"
+        "sql": sql_query
     });
 
-    let exec_res: ExecutionResponse = client
+    let res = client
         .post("https://api.dune.com/api/v1/sql/execute")
         .header("X-DUNE-API-KEY", api_key)
         .header("Content-Type", "application/json")
         .json(&payload)
-        .send()?
-        .json()?;
+        .send()?;
+
+    let response_text = res.text()?;
+    let exec_res: ExecutionResponse = match serde_json::from_str(&response_text) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            eprintln!("Raw API response: {}", response_text);
+            return Ok(0);
+        }
+    };
 
     let execution_id = match exec_res.execution_id {
         Some(id) => id,
@@ -77,19 +77,20 @@ fn fetch_batch(
 
     loop {
         sleep(Duration::from_secs(8));
-        let res: ResultResponse = client
+        let res = client
             .get(&status_url)
             .header("X-DUNE-API-KEY", api_key)
-            .send()?
-            .json()?;
+            .send()?;
 
-        if res.state == "QUERY_STATE_COMPLETED" {
-            if let Some(r) = res.result {
+        let status_res: ResultResponse = res.json()?;
+
+        if status_res.state == "QUERY_STATE_COMPLETED" {
+            if let Some(r) = status_res.result {
                 rows = r.rows;
             }
             break;
-        } else if res.state == "QUERY_STATE_FAILED" || res.state == "QUERY_STATE_CANCELLED" {
-            eprintln!("Query failed for batch #{} with state: {}", batch_num, res.state);
+        } else if status_res.state == "QUERY_STATE_FAILED" || status_res.state == "QUERY_STATE_CANCELLED" {
+            eprintln!("Query failed for batch #{} with state: {}", batch_num, status_res.state);
             return Ok(0);
         }
         println!("Still running batch #{} on Dune... waiting", batch_num);
@@ -124,9 +125,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(120))
         .build()?;
 
-    // Configuration
-    let block_step: u64 = 2_000_000;  // 2 Million blocks per batch
-    let max_blocks: u64 = 42_000_000;  // BNB current total height (~40M+)
+    let block_step: u64 = 2_000_000;
+    let max_blocks: u64 = 42_000_000;
     
     let mut current_block: u64 = 0;
     let mut batch_counter: u32 = 1;
@@ -144,8 +144,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         current_block = next_block;
         batch_counter += 1;
 
-        // Rate limit cooling
-        sleep(Duration::from_secs(3));
+        // Dune free tier rate limiting delay
+        sleep(Duration::from_secs(4));
     }
 
     println!("\nAll batches completed! Total processed rows: {}", total_addresses);

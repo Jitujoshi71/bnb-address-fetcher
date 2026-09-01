@@ -1,4 +1,4 @@
-name: Batch Fetch BNB Addresses & Release
+name: Batch Fetch BNB Addresses & Immediate Release
 
 on:
   workflow_dispatch:
@@ -19,19 +19,19 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Execute Historical Batch Fetcher
+      - name: Create Base GitHub Release
+        id: create_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="bnb-dump-$(date +'%Y%m%d_%H%M%S')"
+          gh release create "$TAG_NAME" --title "BNB Historical Address Dump ($TAG_NAME)" --notes "Live real-time batch uploads of BNB unique addresses."
+          echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
+
+      - name: Execute Real-time Batch Fetcher
         env:
           DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
         run: |
           cargo run --release
-
-      - name: Upload Output Parts to Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: bnb-full-dump-${{ github.run_id }}
-          name: "BNB Historical Address Dump (Batch Export)"
-          body: "Full historical batch export of BNB unique addresses generated via Rust."
-          files: |
-            *.csv.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

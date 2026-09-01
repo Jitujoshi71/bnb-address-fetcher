@@ -10,7 +10,7 @@ use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
-// Multiple free RPC endpoints for round-robin rotation
+// Multiple public RPC endpoints for load balancing
 const PUBLIC_RPCS: &[&str] = &[
     "https://bsc-dataseed.binance.org",
     "https://bsc-dataseed1.defibit.io",
@@ -36,7 +36,6 @@ fn upload_to_release(tag: &str, file_name: &str) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-// 1 single HTTP request mein multiple blocks ek saath fetch karna (JSON-RPC Batching)
 fn fetch_blocks_chunk_with_retry(
     client: &reqwest::blocking::Client,
     blocks: &[u64],
@@ -49,7 +48,6 @@ fn fetch_blocks_chunk_with_retry(
         let rpc_url = PUBLIC_RPCS[*rpc_index % PUBLIC_RPCS.len()];
         *rpc_index += 1;
 
-        // JSON-RPC Batch Payload
         let batch_payload: Vec<Value> = blocks
             .iter()
             .enumerate()
@@ -65,9 +63,13 @@ fn fetch_blocks_chunk_with_retry(
 
         match client.post(rpc_url).json(&batch_payload).send() {
             Ok(resp) => {
-                // Rate limit (429) ya Server overload (503) check
-                if resp.status() == StatusCode::TOO_MANY_REQUESTS || resp.status() == StatusCode::SERVICE_UNAVAILABLE {
-                    eprintln!("Rate limit hit on {}. Backing off for {:?}...", rpc_url, backoff);
+                if resp.status() == StatusCode::TOO_MANY_REQUESTS
+                    || resp.status() == StatusCode::SERVICE_UNAVAILABLE
+                {
+                    eprintln!(
+                        "Rate limit hit on {}. Backing off for {:?}...",
+                        rpc_url, backoff
+                    );
                     sleep(backoff);
                     backoff *= 2;
                     continue;
@@ -75,7 +77,9 @@ fn fetch_blocks_chunk_with_retry(
 
                 if let Ok(Value::Array(responses)) = resp.json::<Value>() {
                     for single_resp in responses {
-                        if let Some(transactions) = single_resp["result"]["transactions"].as_array() {
+                        if let Some(transactions) =
+                            single_resp["result"]["transactions"].as_array()
+                        {
                             for tx in transactions {
                                 let from = tx["from"].as_str().unwrap_or("").to_lowercase();
                                 let to = tx["to"].as_str().unwrap_or("").to_lowercase();
@@ -108,11 +112,14 @@ fn process_batch(
     rpc_index: &mut usize,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     println!("\n==========================================");
-    println!("Fetching Batch #{}: Blocks {} to {}", batch_num, start_block, end_block);
+    println!(
+        "Fetching Batch #{}: Blocks {} to {}",
+        batch_num, start_block, end_block
+    );
     println!("==========================================");
 
     let mut unique_addresses = HashSet::new();
-    let chunk_size = 15; // Ek HTTP request me 15 blocks (Optimal for public nodes)
+    let chunk_size = 15;
 
     let all_blocks: Vec<u64> = (start_block..end_block).collect();
     for chunk in all_blocks.chunks(chunk_size) {
@@ -123,7 +130,6 @@ fn process_batch(
                 unique_addresses.insert(to);
             }
         }
-        // Polite delay taaki IP flag na ho
         sleep(Duration::from_millis(150));
     }
 
@@ -160,15 +166,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(20))
         .build()?;
 
-    let block_step: u64 = 2_000;
-    let start_from_block: u64 = 35_000_000;
-    let target_block: u64 = 35_050_000;
+    let block_step: u64 = env::var("BLOCK_STEP")
+        .unwrap_or_else(|_| "1000".to_string())
+        .parse()
+        .unwrap_or(1000);
+
+    let start_from_block: u64 = env::var("START_BLOCK")
+        .unwrap_or_else(|_| "35000000".to_string())
+        .parse()
+        .unwrap_or(35_000_000);
+
+    let target_block: u64 = env::var("END_BLOCK")
+        .unwrap_or_else(|_| "35010000".to_string())
+        .parse()
+        .unwrap_or(35_010_000);
 
     let mut current_block = start_from_block;
     let mut batch_counter: u32 = 1;
     let mut rpc_index: usize = 0;
 
     println!("Starting safe multi-RPC scraper...");
+    println!(
+        "Range: {} -> {}, Step: {}",
+        start_from_block, target_block, block_step
+    );
 
     while current_block < target_block {
         let next_block = (current_block + block_step).min(target_block);
@@ -187,6 +208,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sleep(Duration::from_secs(1));
     }
 
-    println!("\nAll batches completed!");
+    println!("\nAll batches completed successfully!");
     Ok(())
 }

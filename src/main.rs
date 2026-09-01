@@ -1,12 +1,24 @@
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use serde_json::Value;
+use reqwest::StatusCode;
+use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
-use std::io::{copy, Cursor};
+use std::io::Write;
 use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
+
+// Multiple free RPC endpoints for round-robin rotation
+const PUBLIC_RPCS: &[&str] = &[
+    "https://bsc-dataseed.binance.org",
+    "https://bsc-dataseed1.defibit.io",
+    "https://bsc-dataseed1.ninicoin.io",
+    "https://bsc.drpc.org",
+    "https://binance.llamarpc.com",
+    "https://bscrpc.com",
+];
 
 fn upload_to_release(tag: &str, file_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("Uploading {} directly to release tag '{}'...", file_name, tag);
@@ -17,7 +29,6 @@ fn upload_to_release(tag: &str, file_name: &str) -> Result<(), Box<dyn std::erro
 
     if status.success() {
         println!("Successfully uploaded {} to GitHub Release!", file_name);
-        // Local file remove karein taaki disk space bachi rahe
         let _ = fs::remove_file(file_name);
     } else {
         eprintln!("Failed to upload {} to GitHub Release.", file_name);
@@ -25,102 +36,114 @@ fn upload_to_release(tag: &str, file_name: &str) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-fn fetch_batch(
+// 1 single HTTP request mein multiple blocks ek saath fetch karna (JSON-RPC Batching)
+fn fetch_blocks_chunk_with_retry(
     client: &reqwest::blocking::Client,
-    api_key: &str,
+    blocks: &[u64],
+    rpc_index: &mut usize,
+) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut backoff = Duration::from_secs(2);
+
+    for _attempt in 0..5 {
+        let rpc_url = PUBLIC_RPCS[*rpc_index % PUBLIC_RPCS.len()];
+        *rpc_index += 1;
+
+        // JSON-RPC Batch Payload
+        let batch_payload: Vec<Value> = blocks
+            .iter()
+            .enumerate()
+            .map(|(id, &b)| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "eth_getBlockByNumber",
+                    "params": [format!("0x{:x}", b), true],
+                    "id": id as u64
+                })
+            })
+            .collect();
+
+        match client.post(rpc_url).json(&batch_payload).send() {
+            Ok(resp) => {
+                // Rate limit (429) ya Server overload (503) check
+                if resp.status() == StatusCode::TOO_MANY_REQUESTS || resp.status() == StatusCode::SERVICE_UNAVAILABLE {
+                    eprintln!("Rate limit hit on {}. Backing off for {:?}...", rpc_url, backoff);
+                    sleep(backoff);
+                    backoff *= 2;
+                    continue;
+                }
+
+                if let Ok(Value::Array(responses)) = resp.json::<Value>() {
+                    for single_resp in responses {
+                        if let Some(transactions) = single_resp["result"]["transactions"].as_array() {
+                            for tx in transactions {
+                                let from = tx["from"].as_str().unwrap_or("").to_lowercase();
+                                let to = tx["to"].as_str().unwrap_or("").to_lowercase();
+                                if !from.is_empty() {
+                                    pairs.push((from, to));
+                                }
+                            }
+                        }
+                    }
+                    return pairs;
+                }
+            }
+            Err(e) => {
+                eprintln!("Network error on {} ({}). Retrying...", rpc_url, e);
+                sleep(backoff);
+                backoff *= 2;
+            }
+        }
+    }
+
+    pairs
+}
+
+fn process_batch(
+    client: &reqwest::blocking::Client,
     release_tag: Option<&str>,
     start_block: u64,
     end_block: u64,
     batch_num: u32,
+    rpc_index: &mut usize,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     println!("\n==========================================");
     println!("Fetching Batch #{}: Blocks {} to {}", batch_num, start_block, end_block);
     println!("==========================================");
 
-    let sql_query = format!(
-        "SELECT DISTINCT address FROM (SELECT \"from\" AS address FROM bnb.transactions WHERE block_number >= {} AND block_number < {} UNION ALL SELECT \"to\" AS address FROM bnb.transactions WHERE block_number >= {} AND block_number < {}) AS t WHERE address IS NOT NULL",
-        start_block, end_block, start_block, end_block
-    );
+    let mut unique_addresses = HashSet::new();
+    let chunk_size = 15; // Ek HTTP request me 15 blocks (Optimal for public nodes)
 
-    let payload = serde_json::json!({
-        "sql": sql_query
-    });
-
-    // 1. Submit Query to Dune
-    let res = client
-        .post("https://api.dune.com/api/v1/sql/execute")
-        .header("X-DUNE-API-KEY", api_key)
-        .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()?;
-
-    let resp_val: Value = res.json()?;
-    let execution_id = match resp_val.get("execution_id").and_then(|v| v.as_str()) {
-        Some(id) => id.to_string(),
-        None => {
-            eprintln!("Execution submit failed: {:?}", resp_val);
-            return Ok(false);
-        }
-    };
-
-    println!("Submitted successfully. Execution ID: {}", execution_id);
-
-    // 2. Poll Query Status
-    let status_url = format!("https://api.dune.com/api/v1/execution/{}/status", execution_id);
-    let mut is_completed = false;
-
-    for _ in 0..60 { // Max 60 attempts (~5 mins)
-        sleep(Duration::from_secs(6));
-
-        let res = match client.get(&status_url).header("X-DUNE-API-KEY", api_key).send() {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Status polling retry... ({})", e);
-                continue;
-            }
-        };
-
-        if let Ok(json_res) = res.json::<Value>() {
-            if let Some(state) = json_res.get("state").and_then(|s| s.as_str()) {
-                if state == "QUERY_STATE_COMPLETED" {
-                    is_completed = true;
-                    println!("Query finished on Dune!");
-                    break;
-                } else if state == "QUERY_STATE_FAILED" || state == "QUERY_STATE_CANCELLED" {
-                    eprintln!("Dune Query failed: {:?}", json_res);
-                    return Ok(false);
-                }
+    let all_blocks: Vec<u64> = (start_block..end_block).collect();
+    for chunk in all_blocks.chunks(chunk_size) {
+        let txs = fetch_blocks_chunk_with_retry(client, chunk, rpc_index);
+        for (from, to) in txs {
+            unique_addresses.insert(from);
+            if !to.is_empty() {
+                unique_addresses.insert(to);
             }
         }
-        println!("Still running batch #{} on Dune... waiting", batch_num);
+        // Polite delay taaki IP flag na ho
+        sleep(Duration::from_millis(150));
     }
 
-    if !is_completed {
-        eprintln!("Batch #{} timed out.", batch_num);
-        return Ok(false);
+    if unique_addresses.is_empty() {
+        println!("No addresses found in this range.");
+        return Ok(true);
     }
-
-    // 3. Download CSV Stream & Compress to .csv.gz
-    let csv_url = format!("https://api.dune.com/api/v1/execution/{}/results/csv", execution_id);
-    let mut csv_resp = client
-        .get(&csv_url)
-        .header("X-DUNE-API-KEY", api_key)
-        .send()?;
 
     let file_name = format!("bnb_addresses_part_{:04}.csv.gz", batch_num);
     let file = File::create(&file_name)?;
     let mut encoder = GzEncoder::new(file, Compression::default());
 
-    let mut content = Vec::new();
-    csv_resp.copy_to(&mut content)?;
-
-    let mut cursor = Cursor::new(content);
-    copy(&mut cursor, &mut encoder)?;
+    writeln!(encoder, "address")?;
+    for addr in unique_addresses {
+        writeln!(encoder, "{}", addr)?;
+    }
     encoder.finish()?;
 
-    println!("Batch #{} compressed successfully.", batch_num);
+    println!("Batch #{} written successfully -> {}", batch_num, file_name);
 
-    // 4. Instant Live Upload to GitHub Release
     if let Some(tag) = release_tag {
         if let Err(e) = upload_to_release(tag, &file_name) {
             eprintln!("Upload error for {}: {:?}", file_name, e);
@@ -131,44 +154,39 @@ fn fetch_batch(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = env::var("DUNE_API_KEY").expect("DUNE_API_KEY required");
     let release_tag = env::var("RELEASE_TAG").ok();
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(20))
         .build()?;
 
-    let block_step: u64 = 5_000_000;
-    let max_blocks: u64 = 42_000_000;
+    let block_step: u64 = 2_000;
+    let start_from_block: u64 = 35_000_000;
+    let target_block: u64 = 35_050_000;
 
-    let mut current_block: u64 = 0;
+    let mut current_block = start_from_block;
     let mut batch_counter: u32 = 1;
+    let mut rpc_index: usize = 0;
 
-    println!("Starting real-time continuous batch pipeline...");
+    println!("Starting safe multi-RPC scraper...");
 
-    while current_block < max_blocks {
-        let next_block = (current_block + block_step).min(max_blocks);
-        
-        match fetch_batch(
+    while current_block < target_block {
+        let next_block = (current_block + block_step).min(target_block);
+
+        let _ = process_batch(
             &client,
-            &api_key,
             release_tag.as_deref(),
             current_block,
             next_block,
             batch_counter,
-        ) {
-            Ok(true) => (),
-            Ok(false) => eprintln!("Batch #{} skipped.", batch_counter),
-            Err(e) => eprintln!("Error in batch #{}: {:?}", batch_counter, e),
-        }
+            &mut rpc_index,
+        );
 
         current_block = next_block;
         batch_counter += 1;
-
-        // Rate limit cooling
-        sleep(Duration::from_secs(3));
+        sleep(Duration::from_secs(1));
     }
 
-    println!("\nAll batches finished and uploaded!");
+    println!("\nAll batches completed!");
     Ok(())
 }

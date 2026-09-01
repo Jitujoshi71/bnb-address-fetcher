@@ -138,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(180))
         .build()?;
 
-    let block_step: u64 = 500_000;
+    let block_step: u64 = 5_000_000;
     let max_blocks: u64 = 42_000_000;
 
     let mut current_block: u64 = 0;

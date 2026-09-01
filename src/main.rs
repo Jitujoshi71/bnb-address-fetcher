@@ -2,14 +2,33 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde_json::Value;
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{copy, Cursor};
+use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
+
+fn upload_to_release(tag: &str, file_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Uploading {} directly to release tag '{}'...", file_name, tag);
+
+    let status = Command::new("gh")
+        .args(["release", "upload", tag, file_name, "--clobber"])
+        .status()?;
+
+    if status.success() {
+        println!("Successfully uploaded {} to GitHub Release!", file_name);
+        // Local file remove karein taaki disk space bachi rahe
+        let _ = fs::remove_file(file_name);
+    } else {
+        eprintln!("Failed to upload {} to GitHub Release.", file_name);
+    }
+    Ok(())
+}
 
 fn fetch_batch(
     client: &reqwest::blocking::Client,
     api_key: &str,
+    release_tag: Option<&str>,
     start_block: u64,
     end_block: u64,
     batch_num: u32,
@@ -27,7 +46,7 @@ fn fetch_batch(
         "sql": sql_query
     });
 
-    // 1. Submit Query
+    // 1. Submit Query to Dune
     let res = client
         .post("https://api.dune.com/api/v1/sql/execute")
         .header("X-DUNE-API-KEY", api_key)
@@ -46,17 +65,17 @@ fn fetch_batch(
 
     println!("Submitted successfully. Execution ID: {}", execution_id);
 
-    // 2. Poll Status Safely
+    // 2. Poll Query Status
     let status_url = format!("https://api.dune.com/api/v1/execution/{}/status", execution_id);
     let mut is_completed = false;
 
-    for _ in 0..60 { // Max 60 attempts (~5 mins wait)
+    for _ in 0..60 { // Max 60 attempts (~5 mins)
         sleep(Duration::from_secs(6));
 
         let res = match client.get(&status_url).header("X-DUNE-API-KEY", api_key).send() {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Network glitch while checking status, retrying... ({})", e);
+                eprintln!("Status polling retry... ({})", e);
                 continue;
             }
         };
@@ -65,7 +84,7 @@ fn fetch_batch(
             if let Some(state) = json_res.get("state").and_then(|s| s.as_str()) {
                 if state == "QUERY_STATE_COMPLETED" {
                     is_completed = true;
-                    println!("Query completed successfully on Dune!");
+                    println!("Query finished on Dune!");
                     break;
                 } else if state == "QUERY_STATE_FAILED" || state == "QUERY_STATE_CANCELLED" {
                     eprintln!("Dune Query failed: {:?}", json_res);
@@ -77,11 +96,11 @@ fn fetch_batch(
     }
 
     if !is_completed {
-        eprintln!("Batch #{} timed out or failed to complete.", batch_num);
+        eprintln!("Batch #{} timed out.", batch_num);
         return Ok(false);
     }
 
-    // 3. Download CSV directly via stream (No JSON decoding limits)
+    // 3. Download CSV Stream & Compress to .csv.gz
     let csv_url = format!("https://api.dune.com/api/v1/execution/{}/results/csv", execution_id);
     let mut csv_resp = client
         .get(&csv_url)
@@ -99,41 +118,57 @@ fn fetch_batch(
     copy(&mut cursor, &mut encoder)?;
     encoder.finish()?;
 
-    println!("Successfully saved and compressed to {}", file_name);
+    println!("Batch #{} compressed successfully.", batch_num);
+
+    // 4. Instant Live Upload to GitHub Release
+    if let Some(tag) = release_tag {
+        if let Err(e) = upload_to_release(tag, &file_name) {
+            eprintln!("Upload error for {}: {:?}", file_name, e);
+        }
+    }
+
     Ok(true)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = env::var("DUNE_API_KEY").expect("DUNE_API_KEY env variable required");
+    let api_key = env::var("DUNE_API_KEY").expect("DUNE_API_KEY required");
+    let release_tag = env::var("RELEASE_TAG").ok();
+
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(180))
         .build()?;
 
-    // Configuration: 500k blocks per batch for stable execution
     let block_step: u64 = 500_000;
     let max_blocks: u64 = 42_000_000;
 
     let mut current_block: u64 = 0;
     let mut batch_counter: u32 = 1;
 
-    println!("Starting full historical batch extraction...");
+    println!("Starting real-time continuous batch pipeline...");
 
     while current_block < max_blocks {
         let next_block = (current_block + block_step).min(max_blocks);
         
-        match fetch_batch(&client, &api_key, current_block, next_block, batch_counter) {
+        match fetch_batch(
+            &client,
+            &api_key,
+            release_tag.as_deref(),
+            current_block,
+            next_block,
+            batch_counter,
+        ) {
             Ok(true) => (),
-            Ok(false) => eprintln!("Batch #{} skipped due to execution issue.", batch_counter),
+            Ok(false) => eprintln!("Batch #{} skipped.", batch_counter),
             Err(e) => eprintln!("Error in batch #{}: {:?}", batch_counter, e),
         }
 
         current_block = next_block;
         batch_counter += 1;
 
-        // Rate limit cooling delay
+        // Rate limit cooling
         sleep(Duration::from_secs(3));
     }
 
-    println!("\nAll batches completed!");
+    println!("\nAll batches finished and uploaded!");
     Ok(())
 }
